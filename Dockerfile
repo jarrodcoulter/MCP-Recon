@@ -16,10 +16,10 @@ RUN apt-get update && \
 RUN pip install --no-cache-dir python-nmap modelcontextprotocol mcp
 
 # Copy the server script into the image
-COPY nmap-server.py /app/nmap-server.py
+COPY recon-server.py /app/recon-server.py
 
 # Set the working directory
 WORKDIR /app
 
 # Command to run the MCP server when the container starts
-ENTRYPOINT ["python", "nmap-server.py"]
+ENTRYPOINT ["python", "recon-server.py"]
