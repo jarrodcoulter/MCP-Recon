@@ -1,25 +1,21 @@
-# Dockerfile
+# Multi-stage build: Stage 1 builds BruteSpray (Go), Stage 2 sets up Python server
+FROM golang:1.22 AS build
+WORKDIR /src
+# Fetch BruteSpray source and build the binary
+RUN git clone https://github.com/x90skysn3k/brutespray.git . \
+ && go build -o /brutespray main.go
 
-# Use a minimal Python base image
-FROM python:3.12-slim
-
-# Install nmap and ping (required by your script)
-# Using --no-install-recommends to keep the image small
-RUN apt-get update && \
-    apt-get install -y nmap --no-install-recommends && \
-    # Clean up apt cache to reduce image size
-    rm -rf /var/lib/apt/lists/*
-
-# Install required Python libraries
-# Make sure 'modelcontextprotocol' is the correct package name for mcp.server.fastmcp
-# Adjust if necessary based on your actual MCP library installation.
-RUN pip install --no-cache-dir python-nmap modelcontextprotocol mcp
-
-# Copy the server script into the image
-COPY recon-server.py /app/recon-server.py
-
-# Set the working directory
+FROM python:3.12-slim AS final
 WORKDIR /app
-
-# Command to run the MCP server when the container starts
-ENTRYPOINT ["python", "recon-server.py"]
+# Install Nmap in the slim image
+RUN apt-get update && apt-get install -y --no-install-recommends nmap && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir python-nmap modelcontextprotocol mcp
+# Copy the BruteSpray binary from the builder stage
+COPY --from=build /brutespray /usr/local/bin/brutespray
+RUN chmod +x /usr/local/bin/brutespray
+# Copy wordlists and server code into the image
+COPY users.txt /app/users.txt
+COPY pass.txt /app/pass.txt
+COPY recon-server.py /app/recon-server.py
+# Default command: run the MCP server (communicates over stdio)
+CMD ["python", "recon-server.py"]

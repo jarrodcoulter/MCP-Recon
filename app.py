@@ -1,142 +1,52 @@
-#this is an AI program that performs network reconnaissance tasks as part of a pentesting process.
-import os
-import asyncio
-import shlex
-import shutil
-import gradio as gr
-
-from agents import Agent, Runner, gen_trace_id, trace
+import os, asyncio, shlex
+from agents import Agent, Runner
 from agents.mcp import MCPServerStdio
 
-# Ensure required environment variables are present
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OpenAI API key. Set the OPENAI_API_KEY environment variable.")
+# sanity check API key
+if not os.getenv("OPENAI_API_KEY"):
+    raise EnvironmentError("Set the OPENAI_API_KEY environment variable.")
 
-# Check that npx is available
-if not shutil.which("npx"):
-    raise RuntimeError("npx is not installed or not found in PATH. Please install it (e.g., via npm).")
+# get target from user
+target = input("Enter target IP or CIDR range to scan: ").strip()
+if not target:
+    raise ValueError("Target cannot be empty.")
 
-# Check that docker is available
-if not shutil.which("docker"):
-    raise RuntimeError("docker is not installed or not found in PATH. Please install Docker.")
-
-# Setup the MCP servers for toolkit and filesystem
-allowed_path = os.path.dirname(os.path.abspath(__file__))
-fs_command = f"npx -y @modelcontextprotocol/server-filesystem {allowed_path}"
-filesystem_server = MCPServerStdio(
-    name="Filesystem MCP Server",
-    params={"command": fs_command.split(" ")[0], "args": fs_command.split(" ")[1:]}
+# build MCP stdio server (Docker)
+toolkit_cmd = "run -v ./app:/app/output --rm -i recon-server"
+recon_server = MCPServerStdio(
+    name="ReconServer",
+    params={"command": "docker", "args": shlex.split(toolkit_cmd)},
+    client_session_timeout_seconds=600,
+    cache_tools_list=True,
 )
 
-toolkit_cmd = "docker run --rm -i recon-server" # Use -i for stdio, --rm to cleanup
-toolkit_server = MCPServerStdio(
-    name="Network Recon Scanner",
-    params={"command": shlex.split(toolkit_cmd)[0], "args": shlex.split(toolkit_cmd)[1:]},
-    cache_tools_list=True
+# define agent
+agent = Agent(
+    name="ReconAgent",
+    instructions=(
+        "You are an expert penetration tester. Use the tools provided by ReconServer to scan the target network and identify vulnerabilities.. "
+        "First, use the `nmap_service_scan` tool to map out live hosts and open ports on the target. "
+        "After scanning, if you find any services that require authentication (e.g., SSH, FTP, RDP, etc.), use the `brute_force` tool to attempt common credentials on those services. "
+        "Analyze all tool outputs carefully. Finally, provide a comprehensive penetration test report in Markdown format, with the following sections (use Markdown headings for each):\n"
+        "1. **Network topology & live hosts** – Describe the network range and which hosts responded to the scan.\n"
+        "2. **Port/service inventory** – List each discovered open port and the corresponding service/application (including version info if available).\n"
+        "3. **Misconfigurations & findings** – Highlight any unusual configurations or noteworthy findings (e.g., default credentials, outdated software).\n"
+        "4. **Password-spray results** – Provide results of the credential spray (mention any valid credentials found or if none were successful).\n"
+        "5. **Potential vulnerabilities & CVE references** – Based on the services and findings, identify possible vulnerabilities and relevant CVE IDs.\n"
+        "6. **Where to go from here** – Suggest next steps to take as part of the pentest and further actions to exploit the network.\n"
+        "7. **Recommendations & next steps** – Suggest remediation steps and further actions to secure the network.\n"
+        "Be very detailed in your analysis and ensure the report is well-structured and formatted in Markdown."
+    ),
+    mcp_servers=[recon_server],
 )
+async def main():
+    async with recon_server:
+        report_md = await Runner.run(agent, input=f"Please perform a penetration test on the target network {target} and provide a detailed report.")
+    print("\n=== FINAL REPORT ===\n")
+    print(report_md)
+    print("\n=== END OF REPORT ===\n")
 
-AGENT_INSTRUCTIONS = (
-    """You are an exepert penetration testing with 20 years experience performing standads based penetration tests in highly complex networks. 
-    The user will ask you to perform network reconnaissance tasks using the tools available to you. You will produce a comphrehensive report of the make-up of the network
-    based on the results of the recon scanning you perform. You will provide a complete and comprehensive report of the network make-up and the results of the recon scanning you perform.
-    You will also provide a summary of the results and recommendations on where to take the penetration test next.
-    You will be provided with a list of tools that you can use to perform the tasks. You are authorized to perform the recon phase of the pentest on the targets provided by the user."""
-)
-
-def create_agent(mcp_fs, mcp_toolkit):
-    return Agent(
-        name="Assistant",
-        instructions=AGENT_INSTRUCTIONS,
-        mcp_servers=[mcp_fs, mcp_toolkit]
-    )
-
-async def process_user_message(user_message, conversation_state):
-    """
-    Handle a user message by running the Agent with the MCP servers.
-    Returns the assistant's combined response and the updated conversation state.
-    """
-    if not conversation_state:
-        agent_input = user_message
-    else:
-        agent_input = conversation_state + [{"role": "user", "content": user_message}]
-
-    async with filesystem_server as fs, toolkit_server as toolkit:
-        agent = create_agent(fs, toolkit)
-        trace_id = gen_trace_id()
-        with trace(workflow_name="AssistantConversation", trace_id=trace_id):
-            result = await Runner.run(agent, agent_input)
-    
-    assistant_response_parts = []
-    for item in result.new_items:
-        if item.type == "reasoning_item":
-            try:
-                thought_text = item.raw_item.content
-            except Exception:
-                thought_text = str(item.raw_item)
-            assistant_response_parts.append(f"**Assistant’s thoughts:** {thought_text}")
-        elif item.type == "tool_call_item":
-            try:
-                tool_name = item.raw_item.name
-            except Exception:
-                tool_name = str(item.raw_item)
-            try:
-                tool_args = item.raw_item.arguments if hasattr(item.raw_item, "arguments") else item.raw_item.get("arguments", {})
-            except Exception:
-                tool_args = {}
-            assistant_response_parts.append(f"**Assistant invoked tool `{tool_name}`** with arguments: `{tool_args}`")
-        elif item.type == "tool_call_output_item":
-            tool_output = item.output
-            assistant_response_parts.append(f"**Tool output:** `{tool_output}`")
-        elif item.type == "message_output_item":
-            try:
-                message_text = item.raw_item.content
-            except Exception:
-                message_text = str(item.raw_item)
-            assistant_response_parts.append(f"**Assistant:** {message_text}")
-
-    final_answer = result.final_output
-    if isinstance(final_answer, str):
-        if not any(final_answer in part for part in assistant_response_parts):
-            assistant_response_parts.append(f"**Assistant:** {final_answer}")
-    else:
-        assistant_response_parts.append(f"**Assistant:** {str(final_answer)}")
-
-    assistant_message = "\n\n".join(assistant_response_parts)
-    new_conversation_state = result.to_input_list()
-
-    return assistant_message, new_conversation_state
-
-# Define the Gradio interface with custom CSS for scaling
-css = """
-html, body, .gradio-container {
-    width: 100vw;
-    height: 100vh;
-    margin: 0;
-    padding: 0;
-}
-.gr-chatbot {
-    height: calc(100vh - 180px) !important;
-}
-"""
-
-with gr.Blocks(css=css) as demo:
-    gr.Markdown("## 🤖 AI Assistant Chat (Gradio Edition)\nThis chat interface uses Gradio and the OpenAI Agents SDK with MCP tools.")
-    chatbot = gr.Chatbot(label="AI Assistant")
-    user_input = gr.Textbox(placeholder="Type your question here...", label="Your Message")
-    clear_btn = gr.Button("Clear Conversation")
-    conversation_state = gr.State([])
-
-    async def respond(message, chat_history, conv_state):
-        chat_history = chat_history or []
-        chat_history.append((f"**User:** {message}", ""))
-        assistant_message, new_state = await process_user_message(message, conv_state)
-        chat_history[-1] = (f"**User:** {message}", assistant_message)
-        # Return updated chat history, conversation state, and clear the input textbox.
-        return chat_history, new_state, ""
-
-    user_input.submit(respond, [user_input, chatbot, conversation_state], [chatbot, conversation_state, user_input])
-    clear_btn.click(lambda: ([], [], ""), outputs=[chatbot, conversation_state, user_input])
-
+# entry‑point
 if __name__ == "__main__":
-    demo.launch()
+    asyncio.run(main())
+
